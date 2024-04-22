@@ -1,0 +1,769 @@
+---
+title: "Dölen RNA-Seq analysis - NAb Psychadelics"
+date: "7/10/2021"
+output: html_document
+---
+
+```{r init,echo=FALSE,warning=FALSE,message=FALSE}
+library(sleuth)
+library(BUSpaRse)
+library(knitr)
+library(stringr)
+library(ggrepel)
+library(readr)
+library(rmarkdown)
+library('cowplot')
+library(gridExtra)
+library(msigdbr)
+library(data.table)
+library(dplyr)
+library(formattable)
+library(VennDiagram)
+
+
+setwd(path)
+
+source('sup_fns.R')
+```
+
+```{r colors}
+#Matched colors to manuscript
+cmy = function(c, m, y, alpha, maxColorValue=1){
+  if(maxColorValue != 1) { c <- c/maxColorValue; m <- m/maxColorValue; y <- y/maxColorValue }
+  c <- 1-c; m <- 1-m; y <- 1-y
+  hex <- function(v) substring(rgb(v,0,0),2,3)
+  if(!missing(alpha)) alpha <- hex(alpha) else alpha <- ''
+  paste0('#',hex(c), hex(m), hex(y), alpha)
+}
+LSD<-c(8,46,100)
+Psilocybin<-c(94, 90, 0)
+MDMA<-c(40, 100, 100)
+Ketamine<-c(22, 88, 0)
+Ibogaine<-c(57, 0, 99)
+None<-c(32, 27, 26) 
+Saline<-c(32, 27, 26) 
+cmyFUN<-function(x){cmy(x[1],x[2],x[3],1,max(x))}
+match_col<-sapply(list(Ketamine,LSD,MDMA,Saline), cmyFUN)
+match_col<-c("#575757",match_col)
+names(match_col)<-c("cocaine","ketamine","LSD","MDMA","saline")
+```
+
+# Data Import
+
+```{r import}
+#s2c<-read.csv("../../metadata/BulkRNAPsychodelics_5.25.2021.csv")
+s2c <- read_csv("/mnt/morbo/Data/Users/XXX/psychadelic_study_NAb/metadata/BulkRNAPsychodelics_5.25.2021.csv")
+s2c$path<-paste0("/mnt/morbo/Data/Users/XXX/psychadelic_study_NAb/kallisto/",s2c$sample)
+s2c$treatment<-factor(s2c$treatment,levels=c("saline","cocaine","ketamine","LSD","MDMA")) # set saline as the control condition.
+s2c$days<-factor(s2c$days,levels=c("day2","day14")) 
+s2c$rna_isolation_batch<-as.factor(s2c$rna_isolation_batch)
+#View(s2c)
+# Design matrix
+#DT::datatable(s2c)
+```
+
+# Gene Annotation
+
+```{r annot}
+
+t2g<-read.delim("/mnt/morbo/Data/indexes/mouse/mm10/kallisto/gencode_vM25/transcripts_to_genes.txt",header=F)
+colnames(t2g)<-c("target_id","gene_id","ext_gene")
+```
+
+# Construct Sleuth Object
+Here we are building the 'sleuth' [@Pichardo-Casas2012]object that will contain all of the necessary data from day2 only for the differential test (including bootstraps).
+
+```{r construct_so2,cache=FALSE}
+so2<-sleuth_prep(s2c[s2c$days=="day2",],extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id") 
+#so<-sleuth_prep(s2c,extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id") 
+#saveRDS(so2,file="cache/psychadelic_study_NAb_day2only.rds")
+#so2<-readRDS("/mnt/morbo/Data/Users/XXX/psychadelic_study_NAb/analysis/NAb_psychadelics/cache/psychadelic_study_NAb_day2only.rds")
+
+```
+
+Before we look at the significance test(s), here are some QC plots.
+
+## Basic QC
+
+```{r QC}
+x<-'rna_isolation_batch'
+plot_pca(so2,color_by = x,units = 'scaled_reads_per_base',pc_x=1L,pc_y=2L,text_labels =TRUE)
+
+covariates<-c('treatment','rna_isolation_batch','critical_period','num_slices','RNA_extraction_order','concentration')
+
+p<-list()
+for(x in covariates){
+    p[[x]]<-plot_pca(so2,color_by = x,units = 'scaled_reads_per_base',pc_x=1L,pc_y=2L,text_labels =TRUE)
+    p[[x]]<- p[[x]] + theme(legend.position="top")
+}
+
+for(x in 1:3){
+     p[[x]]<- p[[x]] +  scale_color_manual(values=match_col)
+}
+p[[1]]
+#g<-do.call(grid.arrange,p)
+
+pdf(paste0(path,"/plots/PCA_Day2only.pdf"),width=8,height=11)
+grid.arrange(arrangeGrob(grobs=p,ncol=2))
+dev.off()
+
+
+pdf(paste0(path,"/plots/DensityByCriticalPeriod_Day2Only.pdf"))
+plot_group_density(so2, use_filtered = TRUE, units = "tpm", trans = "log", grouping = "critical_period", offset = 1)
+dev.off()
+
+```
+
+
+# Model fitting
+
+# Cocaine grouped with psychadelics - Figure S4 ('Cocaine-fail') 'Saline vs Drug Treated'
+```{r}
+so<-sleuth_prep(s2c,extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id")
+
+## Testing the effect of any treatment vs saline (to identify 'cocaine-fail' genes or genes that are DE in _any_ treatment vs saline)
+so <- sleuth_fit(so, ~rna_isolation_batch+treated_vs_untreated, 'reduced_treatment')
+#so2 <- sleuth_fit(so2, ~rna_isolation_batch+treatment, 'reduced_CP')
+so <- sleuth_fit(so, ~rna_isolation_batch, 'reduced')
+
+so<-sleuth_lrt(so, 'reduced','reduced_treatment')
+
+```
+
+And here we can generate a table of significant genes
+```{r prelim_results}
+qval<-0.15
+sleuth_table_treated <- sleuth_results(so, 'reduced:reduced_treatment', 'lrt', show_all = FALSE)
+sleuth_table_treated <- sleuth_table_treated[!is.na(sleuth_table_treated$pval),] #valid tests only
+head(kable(sleuth_table_treated))
+sleuth_significant_treated <- sleuth_table_treated[sleuth_table_treated$qval <= qval,]
+dim(sleuth_significant_treated)[1]
+kable(sleuth_significant_treated)
+```
+
+```{r FigS4_lrt_heatmap}
+#genes<-sapply(FigS5_sleuth_significant$target_id, function(x) FigS5_sleuth_significant[FigS5_sleuth_significant$target_id==x,"ext_gene"])
+
+figS4<-plot_transcript_heatmap_mod(so,sleuth_significant_treated, 'scaled_reads_per_base', cluster_transcripts = TRUE,
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period","treated_vs_untreated"), scale = "row",
+                        color_high="yellow",color_mid="black",color_low="blue",show_rownames=TRUE,
+                        main=paste0("All samples treated vs saline L.R.T q<",qval), #labels_row = genes, 
+                        clustering_distance_col="euclidean"
+                        )
+
+
+plot(figS4)
+  
+dev.off() # LG: For some reason this plot function doesn't always close the device which corrupts .pdf files.  So forcefully closing here.
+
+pdf("plots/FigureS4/LRT_heatmap_treated_vs_untreated.pdf",width=7,height=10)
+plot_transcript_heatmap_mod(so,sleuth_significant_treated, 'scaled_reads_per_base', cluster_transcripts = TRUE,
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period","treated_vs_untreated"), scale = "row",
+                        color_high="yellow",color_mid="black",color_low="blue",show_rownames=TRUE,
+                        main=paste0("All samples treted vs saline L.R.T q<",qval), #labels_row = genes, 
+                        clustering_distance_col="euclidean"
+                        )
+dev.off()
+
+```
+
+## TPM plots for treated_vs_untreated
+```{r}
+genes_to_plot_treated<-so$obs_norm[so$obs_norm$target_id %in% sleuth_significant_treated$target_id,]
+genes_to_plot_treated<-merge(genes_to_plot_treated,s2c,by="sample",all.x=TRUE)
+
+genes_summary_treated<-genes_to_plot_treated %>%
+  group_by(target_id,treatment,days) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+genes_summary_treatment_treated<-genes_to_plot_treated %>%
+  group_by(target_id,treatment) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+  
+
+pdf("plots/FigureS4/sigGenes_barplots_log_ratio_to_saline_saline_vs_treated.pdf",width=6,height=3)
+for(gene in sleuth_significant_treated$target_id){
+  message(gene)
+  #gene<-sleuth_significant$target_id[1]
+  p<-ggplot(genes_summary_treated[genes_summary_treated$target_id == gene,],aes(x=days,y=log(mean/genes_summary_treatment_treated$mean[genes_summary_treatment_treated$target_id==gene & genes_summary_treatment_treated$treatment == "saline"]))) +
+    geom_bar(aes(fill=treatment),stat="identity",color="black") +
+    geom_errorbar(aes(x=days,
+                      y=log(mean/genes_summary_treatment_treated$mean[genes_summary_treatment_treated$target_id==gene & genes_summary_treatment_treated$treatment == "saline"]),
+                      ymin=log(mean/genes_summary_treatment_treated$mean[genes_summary_treatment_treated$target_id==gene & genes_summary_treatment_treated$treatment == "saline"])-sqrt(se**2/mean**2),
+                      ymax=log(mean/genes_summary_treatment_treated$mean[genes_summary_treatment_treated$target_id==gene & genes_summary_treatment_treated$treatment == "saline"])+sqrt(se**2/mean**2)),
+                  width=0.5
+                  ) +
+    geom_point(aes(x=days,y=log(tpm/genes_summary_treatment_treated$mean[genes_summary_treatment_treated$target_id==gene & genes_summary_treatment_treated$treatment == "saline"]),fill=treatment),data=genes_to_plot_treated[genes_to_plot_treated$target_id == gene,],color="black",shape=21,size=2) +
+    scale_fill_manual(values=match_col[c(5,1,2,3,4)]) +
+    ggtitle(sleuth_significant_treated$ext_gene[sleuth_significant_treated$target_id == gene]) +
+    monocle3:::monocle_theme_opts() + 
+    geom_hline(yintercept = 0,linetype="solid") +
+    xlab("Treatment") +
+    ylab("TPM log ratio to Saline Mean") +
+    guides(fill="none",color="none") +
+    facet_grid(~treatment)
+  
+  plot(p)
+}
+dev.off()
+```
+
+# TPM plots of gene subset for figure S4
+```{r}
+target_genes<-c("Camsap1","Gprasp1","Ubr4","Ube4b","Akap12","Eif4g1","Myo16","Chd8")
+
+target_ids<-unlist(lapply(target_genes,function(x){sleuth_significant_treated$target_id[sleuth_significant_treated$ext_gene == x]}))
+
+target_genes_to_plot_treated<-so$obs_norm[so$obs_norm$target_id %in% target_ids,]
+target_genes_to_plot_treated<-merge(target_genes_to_plot_treated,s2c,by="sample",all.x=TRUE)
+
+target_genes_summary_treated<-target_genes_to_plot_treated %>%
+  group_by(target_id,treatment,days) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+target_genes_summary_treatment_treated<-target_genes_to_plot_treated %>%
+  group_by(target_id,treatment) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+
+#pdf("plots/Figure4/sigGenes_barplots_log_ratio_to_saline_critical_period.pdf",width=6,height=3)
+plots<-list()
+plots<-lapply(target_ids,function(gene){
+  message(gene)
+  #gene<-sleuth_significant$target_id[1]
+  ggplot(target_genes_summary_treated[target_genes_summary_treated$target_id == gene,],aes(x=days,y=log(mean/target_genes_summary_treatment_treated$mean[target_genes_summary_treatment_treated$target_id==gene & target_genes_summary_treatment_treated$treatment == "saline"]))) +
+    geom_bar(aes(fill=treatment),stat="identity",color="black") +
+    geom_errorbar(aes(x=days,
+                      y=log(mean/target_genes_summary_treatment_treated$mean[target_genes_summary_treatment_treated$target_id==gene & target_genes_summary_treatment_treated$treatment == "saline"]),
+                      ymin=log(mean/target_genes_summary_treatment_treated$mean[target_genes_summary_treatment_treated$target_id==gene & target_genes_summary_treatment_treated$treatment == "saline"])-sqrt(se**2/mean**2),
+                      ymax=log(mean/target_genes_summary_treatment_treated$mean[target_genes_summary_treatment_treated$target_id==gene & target_genes_summary_treatment_treated$treatment == "saline"])+sqrt(se**2/mean**2)),
+                  width=0.5
+                  ) +
+    geom_point(aes(x=days,y=log(tpm/target_genes_summary_treatment_treated$mean[target_genes_summary_treatment_treated$target_id==gene & target_genes_summary_treatment_treated$treatment == "saline"]),fill=treatment),data=target_genes_to_plot_treated[target_genes_to_plot_treated$target_id == gene,],color="black",shape=21,size=2) +
+    scale_fill_manual(values=match_col[c(5,1,2,3,4)]) +
+    ggtitle(sleuth_significant_treated$ext_gene[sleuth_significant_treated$target_id == gene]) +
+    monocle3:::monocle_theme_opts() + 
+    geom_hline(yintercept = 0,linetype="solid") +
+    xlab("Treatment") +
+    ylab("TPM log ratio to Saline Mean") +
+    guides(fill="none",color="none") +
+    facet_grid(~treatment)
+
+})
+
+pdf("plots/FigureS4/FigureS4.pdf",width=18,height=12)
+right_side<-plot_grid(plots[[1]],plots[[2]],plots[[3]],plots[[4]],plots[[5]],plots[[6]],plots[[7]],plots[[8]],ncol = 2,labels=letters[2:9])
+Full_FigureS4<-plot_grid(figS4$gtable, right_side,rel_widths = c(2,1),labels=c(letters[1],""),nrow=1)
+Full_FigureS4
+dev.off()
+
+```
+
+
+# All Samples critical period (Figure 4)
+```{r}
+#so<-sleuth_prep(s2c,extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id")
+
+## Testing the effect of any treatment vs saline (to identify 'cocaine-fail' genes or genes that are DE in _any_ treatment vs saline)
+#so <- sleuth_fit(so, ~rna_isolation_batch+treated_vs_untreated, 'reduced_treatment')
+#so2 <- sleuth_fit(so2, ~rna_isolation_batch+treatment, 'reduced_CP')
+#so <- sleuth_fit(so, ~rna_isolation_batch, 'reduced')
+so <- sleuth_fit(so, ~rna_isolation_batch+critical_period,'reduced_critical_period')
+
+```
+```{r critical_period_lrt}
+so<-sleuth_lrt(so, 'reduced','reduced_critical_period')
+
+```
+
+And here we can generate a table of significant genes
+```{r prelim_results}
+qval<-0.1
+sleuth_table_critical_period <- sleuth_results(so, 'reduced:reduced_critical_period', 'lrt', show_all = FALSE)
+sleuth_table_critical_period <- sleuth_table_critical_period[!is.na(sleuth_table_critical_period$pval),] #valid tests only
+#head(kable(sleuth_table_critical_period))
+sleuth_significant_critical_period <- sleuth_table_critical_period[sleuth_table_critical_period$qval <= qval,]
+dim(sleuth_significant_critical_period)[1]
+kable(sleuth_significant_critical_period)
+```
+
+```{r FigS4_lrt_heatmap}
+#genes<-sapply(FigS5_sleuth_significant$target_id, function(x) FigS5_sleuth_significant[FigS5_sleuth_significant$target_id==x,"ext_gene"])
+
+fig4<-plot_transcript_heatmap_mod(so,sleuth_significant_critical_period, 'scaled_reads_per_base', cluster_transcripts = TRUE,
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period"), scale = "row",
+                        color_high="yellow",color_mid="black",color_low="blue",
+                        main=paste0("All samples critical period L.R.T q<",qval), #labels_row = genes, 
+                        clustering_distance_col="correlation"
+                        )
+
+
+plot(fig4)
+  
+dev.off() # LG: For some reason this plot function doesn't always close the device which corrupts .pdf files.  So forcefully closing here.
+
+pdf("plots/Figure4/LRT_heatmap_critical_period.pdf",width=7,height=10)
+plot_transcript_heatmap_mod(so,sleuth_significant_critical_period, 'scaled_reads_per_base', cluster_transcripts = TRUE,
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period"), scale = "row",
+                        color_high="yellow",color_mid="black",color_low="blue",show_rownames=FALSE,
+                        main=paste0("All samples critical period L.R.T q<",qval), #labels_row = genes, 
+                        clustering_distance_col="correlation"
+                        )
+dev.off()
+
+```
+
+## TPM plots for critical period
+```{r}
+genes_to_plot_critical_period<-so$obs_norm[so$obs_norm$target_id %in% sleuth_significant_critical_period$target_id,]
+genes_to_plot_critical_period<-merge(genes_to_plot_critical_period,s2c,by="sample",all.x=TRUE)
+
+genes_summary_critical_period<-genes_to_plot_critical_period %>%
+  group_by(target_id,treatment,days) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+genes_summary_treatment_critical_period<-genes_to_plot_critical_period %>%
+  group_by(target_id,treatment) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+  
+  
+pdf("plots/Figure4/sigGenes_barplots_log_ratio_to_saline_critical_period.pdf",width=6,height=3)
+for(gene in sleuth_significant_critical_period$target_id){
+  message(gene)
+  #gene<-sleuth_significant$target_id[1]
+  p<-ggplot(genes_summary_critical_period[genes_summary_critical_period$target_id == gene,],aes(x=days,y=log(mean/genes_summary_treatment_critical_period$mean[genes_summary_treatment_critical_period$target_id==gene & genes_summary_treatment_critical_period$treatment == "saline"]))) +
+    geom_bar(aes(fill=treatment),stat="identity",color="black") +
+     geom_errorbar(aes(x=days,
+                      y=log(mean/genes_summary_treatment_critical_period$mean[genes_summary_treatment_critical_period$target_id==gene & genes_summary_treatment_critical_period$treatment == "saline"]),
+                      ymin=log(mean/genes_summary_treatment_critical_period$mean[genes_summary_treatment_critical_period$target_id==gene & genes_summary_treatment_critical_period$treatment == "saline"])-sqrt(se**2/mean**2),
+                      ymax=log(mean/genes_summary_treatment_critical_period$mean[genes_summary_treatment_critical_period$target_id==gene & genes_summary_treatment_critical_period$treatment == "saline"])+sqrt(se**2/mean**2)),
+                  width=0.5
+                  ) +
+    geom_point(aes(x=days,y=log(tpm/genes_summary_treatment_critical_period$mean[genes_summary_treatment_critical_period$target_id==gene & genes_summary_treatment_critical_period$treatment == "saline"]),fill=treatment),data=genes_to_plot_critical_period[genes_to_plot_critical_period$target_id == gene,],color="black",shape=21,size=2) +
+    scale_fill_manual(values=match_col[c(5,1,2,3,4)]) +
+    ggtitle(sleuth_significant_critical_period$ext_gene[sleuth_significant_critical_period$target_id == gene]) +
+    monocle3:::monocle_theme_opts() + 
+    geom_hline(yintercept = 0,linetype="solid") +
+    xlab("Treatment") +
+    ylab("TPM Ratio to Saline Mean") +
+    guides(fill="none",color="none") +
+    facet_grid(~treatment)
+  
+  plot(p)
+}
+dev.off()
+```
+
+# TPM plots of gene subset for figure 4
+```{r}
+target_genes<-c("Tinagl1","Fn1","Adgre5","Cxcr4","Trpv4","Sema3g","Robo4","Nostrin")
+
+target_ids<-lapply(target_genes,function(x){sleuth_significant_critical_period$target_id[sleuth_significant_critical_period$ext_gene == x]})
+
+target_genes_to_plot_critical_period<-so$obs_norm[so$obs_norm$target_id %in% target_ids,]
+target_genes_to_plot_critical_period<-merge(target_genes_to_plot_critical_period,s2c,by="sample",all.x=TRUE)
+
+target_genes_summary_critical_period<-target_genes_to_plot_critical_period %>%
+  group_by(target_id,treatment,days) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+target_genes_summary_treatment_critical_period<-target_genes_to_plot_critical_period %>%
+  group_by(target_id,treatment) %>%
+  summarise(mean=mean(tpm), sd=sd(tpm), se=sd/sqrt(n()))
+
+
+#pdf("plots/Figure4/sigGenes_barplots_log_ratio_to_saline_critical_period.pdf",width=6,height=3)
+plots<-list()
+plots<-lapply(target_ids,function(gene){
+  message(gene)
+  #gene<-sleuth_significant$target_id[1]
+  ggplot(target_genes_summary_critical_period[target_genes_summary_critical_period$target_id == gene,],aes(x=days,y=log(mean/target_genes_summary_treatment_critical_period$mean[target_genes_summary_treatment_critical_period$target_id==gene & target_genes_summary_treatment_critical_period$treatment == "saline"]))) +
+    geom_bar(aes(fill=treatment),stat="identity",color="black") +
+    geom_errorbar(aes(x=days,
+                      y=log(mean/target_genes_summary_treatment_critical_period$mean[target_genes_summary_treatment_critical_period$target_id==gene & target_genes_summary_treatment_critical_period$treatment == "saline"]),
+                      ymin=log(mean/target_genes_summary_treatment_critical_period$mean[target_genes_summary_treatment_critical_period$target_id==gene & target_genes_summary_treatment_critical_period$treatment == "saline"])-sqrt(se**2/mean**2),
+                      ymax=log(mean/target_genes_summary_treatment_critical_period$mean[target_genes_summary_treatment_critical_period$target_id==gene & target_genes_summary_treatment_critical_period$treatment == "saline"])+sqrt(se**2/mean**2)),
+                  width=0.5
+                  ) +
+    geom_point(aes(x=days,y=log(tpm/target_genes_summary_treatment_critical_period$mean[target_genes_summary_treatment_critical_period$target_id==gene & target_genes_summary_treatment_critical_period$treatment == "saline"]),fill=treatment),data=target_genes_to_plot_critical_period[target_genes_to_plot_critical_period$target_id == gene,],color="black",shape=21,size=2) +
+    scale_fill_manual(values=match_col[c(5,1,2,3,4)]) +
+    ggtitle(sleuth_significant_critical_period$ext_gene[sleuth_significant_critical_period$target_id == gene]) +
+    monocle3:::monocle_theme_opts() + 
+    geom_hline(yintercept = 0,linetype="solid") +
+    xlab("Treatment") +
+    ylab("TPM Ratio to Saline Mean") +
+    guides(fill="none",color="none") +
+    facet_grid(~treatment)
+
+})
+
+pdf("plots/Figure4/Figure4.pdf",width=18,height=12)
+right_side<-plot_grid(plots[[1]],plots[[2]],plots[[3]],plots[[4]],plots[[5]],plots[[6]],plots[[7]],plots[[8]],ncol = 2,labels=letters[2:9])
+Full_Figure4<-plot_grid(fig4$gtable, right_side, rel_widths = c(2,1),labels=c(letters[1],""),nrow=1)
+Full_Figure4
+dev.off()
+```
+
+
+
+# Wald test
+
+The second type of statistical test we will do is the Wald test, allows us to compare each conditions to a baseline condition (control) to determine if there is a significant effect. Here, the estimated coefficients also encode direction of effect. 
+
+## treatment specific effects
+```{r ketamine_wald}
+sig_thresh<-0.2
+model<-"reduced_treatment"
+indx<-grep("treatment",colnames(so2$fits[[model]]$design_matrix))
+for(i in colnames(so2$fits[[model]]$design_matrix)[indx]){
+  so<-sleuth_wt(so, i ,which_model=model)
+}
+
+```
+
+```{r CP_wald_table}
+sig_gene_ids<-list()
+numSG<-list()
+for(i in colnames(so2$fits[[model]]$design_matrix)[indx]){
+  sleuth_table <- sleuth_results(so2, i, test_type='wald', which_model=model, show_all = FALSE)
+  sleuth_table <- sleuth_table[!is.na(sleuth_table$pval),] #valid tests only
+  sleuth_table$b_zscore<-sleuth_table$b/sleuth_table$se_b
+  sleuth_significant <- sleuth_table[sleuth_table$qval <= sig_thresh,]
+  sig_gene_ids[[i]]<-sapply(sleuth_significant$target_id, function(x) sleuth_significant[sleuth_significant$target_id==x,"ext_gene"])
+  numSG[[i]]<-dim(sleuth_significant)[1]
+  print(dim(sleuth_significant[1]))
+  pdf(paste0(path,"/plots/Wald_saline_vs_",i,"_heatmap_",model,".pdf"),width=10,height=10)
+  plot_transcript_heatmap_mod(so2,sleuth_significant,'scaled_reads_per_base', # can replace with 'tpm' as needed
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period"), scale = "row",
+                        color_high="yellow",color_mid="blue",color_low="black",main=paste("Sig Genes Wald Test saline vs", i)
+  )
+  dev.off()
+}
+
+```
+There are `r numSG` significant genes between `r names(numSG)` and saline at a q-value cutoff of `r sig_thresh`
+
+```{r VennDiagram}
+
+venn.diagram(
+  x = sig_gene_ids, category.names = gsub("treatment","",names(sig_gene_ids)),
+  filename = paste0(path,'/plots/Treatmentspecific_venn_diagramm.png'),
+  output = TRUE)
+
+          imagetype="png" ,
+          #height = 480 , 
+          #width = 480 , 
+          #resolution = 300,
+          #compression = "lzw",
+          lwd = 1,
+          col=match_col[1:4]
+          fill = c(alpha(match_col[1],0.3), alpha(match_col[2],0.3), alpha(match_col[3],0.3), alpha(match_col[4],0.3)),
+          #cex = 0.5,
+          fontfamily = "sans",
+          #cat.cex = 0.3,
+          cat.default.pos = "outer",
+          #cat.pos = c(-27, 27, 135),
+          #cat.dist = c(0.055, 0.055, 0.085),
+          cat.fontfamily = "sans",
+          cat.col = match_col[1:4],
+          rotation = 1
+)
+
+sg<-calculate.overlap(sig_gene_ids) 
+str(sg)
+
+
+```
+
+###############################################################################
+###############################################################################
+
+Here we are building the 'sleuth' [@Pichardo-Casas2012]object from both time points.
+
+```{r construct_so,cache=FALSE}
+# full data object 
+#so<-sleuth_prep(s2c,extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id") # gene-level analysis
+#saveRDS(so,file=paste0(path,"/cache/psychadelic_study_NAb_full.rds"))
+so<-readRDS(paste0(path,"/cache/psychadelic_study_NAb_full.rds"))
+
+#excluding 2 saline sample2 as potential outliers 
+#soS<-sleuth_prep(s2c[-c(1:2),],extra_bootstrap_summary=TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id") 
+
+# excluding MDMA
+#soM<-sleuth_prep(s2c[!s2c$treatment=="MDMA",],extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=TRUE,aggregation_column="gene_id") #day2 and not MDMA
+#saveRDS(soM,file="cache/psychadelic_study_NAb_minusMDMA.rds")
+#soM<-readRDS("cache/psychadelic_study_NAb_minusMDMA.rds")
+
+#so<-sleuth_prep(s2c,extra_bootstrap_summary = TRUE,target_mapping=t2g,gene_mode=FALSE) # Uncomment for isoform-level analysis
+```
+
+Before we look at the significance test(s), here are some QC plots.
+
+## Basic QC
+
+```{r QC}
+covariates<-c('treatment','rna_isolation_batch','critical_period','num_slices','RNA_extraction_order','concentration')
+
+p<-list()
+for(x in covariates){
+    p[[x]]<-plot_pca(so,color_by = x,units = 'scaled_reads_per_base',pc_x=1L,pc_y=2L,text_labels =TRUE)
+    p[[x]]<- p[[x]] + theme(legend.position="top")
+}
+
+for(x in 1:3){
+     p[[x]]<- p[[x]] +  scale_color_manual(values=match_col)
+}
+p[[1]]
+
+
+pdf(paste0(path,"/plots/PCA_full.pdf"),width=8,height=11)
+grid.arrange(arrangeGrob(grobs=p,ncol=2))
+dev.off()
+
+pdf("plots/DensityByCriticalPeriod_Full.pdf")
+plot_group_density(so, use_filtered = TRUE, units = "tpm", trans = "log", grouping = "critical_period", offset = 1)
+dev.off()
+
+p<-plot_sample_heatmap(so,annotation_cols = covariates,clustering_distance_col="correlation")
+p
+```
+
+
+# Model fitting
+
+We are fitting two models to the data. The first, 'full', is a model that accounts for the day, treatment, critical period status, and RNA isolation catch (see design matrix). The reduced models does not consider the critical period status as an explanatory variable.
+
+```{r full, cache=FALSE}
+#so <- sleuth_fit(so, ~rna_isolation_batch+critical_period+treatment, 'full') # Fit full model
+#so <- sleuth_fit(so, ~rna_isolation_batch+treatment, 'reduced_CP') # Fit reduced model against which to compare full
+#so <- sleuth_fit(so, ~rna_isolation_batch+critical_period, 'reduced_treatment') # Fit reduced model against which to compare full
+#so <- sleuth_fit(so, ~rna_isolation_batch, 'reduced') # Fit reduced model against which to compare full
+#so <- sleuth_fit(so, ~critical_period+days+treatment, 'reduced_batch')
+#saveRDS(so,file=paste0(path,"/cache/psychadelic_study_NAb_full.rds"))
+so<-readRDS(paste0(path,"/cache/psychadelic_study_NAb_full.rds"))
+models(so)
+
+so<-sleuth_lrt(so, 'reduced','reduced_treatment')
+#sleuth_table_gene <- sleuth_results(so, 'reduced_CP:full', 'lrt', show_all = FALSE)
+```
+
+# Likelihood ratio test
+
+We will perform two different types of DE test.  The first is the likelihood ratio test which is asking whether the addition of `condition` as an explanatory variable is better able to explain the variance of the model fit for any given gene.  If yes, then the gene expression is a significant function of this discrete factor.  Importantly, this test does not tell us anything about the direction of effect (e.g. Up- or down-regulated in any samples or conditions in particular) but only whether the discretization of samples into these groups explains a significant amount of variance within the data.
+
+```{r lrt}
+# replicate model from day 2 analysis 
+so<-sleuth_lrt(so, 'reduced','reduced_treatment')
+sleuth_table_gene <- sleuth_results(so, 'reduced','reduced_treatment', 'lrt', show_all = FALSE)
+sleuth_live(so)
+```
+
+
+And here we can generate a table of significant genes
+```{r prelim_results_full}
+qval<-.2
+sleuth_table_gene <- dplyr::filter(sleuth_table_gene, qval <= qval)
+sleuth_significant_2 <- sleuth_table_gene[sleuth_table_gene$qval <= qval,]
+dim(sleuth_significant_2)[1]
+View(sleuth_significant_2)
+
+
+customGreen0 = "#DeF7E9"
+customGreen = "#71CA97"
+customRed = "#ff7f7f"
+
+formattable(sleuth_significant_2, align =c("l","l","c","c","c", "c", "c", "c","c", "c", "c", "r"), list(
+  `Indicator Name` = formatter("span", style = ~ style(color = "grey",font.weight = "bold")), 
+  `qval` = color_bar(customRed)
+  ))
+
+write.csv(sleuth_significant_2, file="cache/psychadelic_study_NAb_full_DE4CP.csv")
+```
+There are `r dim(sleuth_significant)[1]`significant genes at a q-value cutoff of `r qval`
+
+```{r lrt_heatmap}
+p<-plot_transcript_heatmap_mod(so,sleuth_significant_2, 'tpm', cluster_transcripts = FALSE,
+                        annotation_cols = c('treatment','rna_isolation_batch','critical_period'),
+                        color_high="yellow",color_mid="blue",color_low="black",
+                        main=paste0("All Sig Genes L.R.T q<",qval), scale = "row",
+                        clustering_distance_col="correlation"
+                        )
+
+dev.off()
+
+pdf("plots/LRT_heatmap_Full.pdf",width=8,height=8)
+plot_transcript_heatmap_mod(so,sleuth_significant_2, 'tpm', cluster_transcripts = TRUE,
+                        annotation_cols = c('treatment','rna_isolation_batch','critical_period'),
+                        color_high="yellow",color_mid="blue",color_low="black",
+                        main=paste0("All Sig Genes L.R.T q<",qval), scale = "row",
+                        clustering_distance_col="correlation"
+                        )
+dev.off()
+
+```
+
+
+Plot aggregrates to show direction and magnitude of difference
+
+```{r plot_agregate}
+
+df <- lapply(sleuth_significant_2$target_id,function(x) sleuth:::get_bootstrap_summary(so, x, units= "scaled_reads_per_base"))
+
+x<-sleuth_significant_2$target_id[1]
+df<-data.frame(cbind(rep(x,length(tmp$mid)),rep(sleuth_significant_2[sleuth_significant_2$target_id==x,"ext_gene"],length(tmp$mid)),
+          tmp$mid,tmp$sample,tmp$treatment,tmp$critical_period))
+colnames(df)<-c("target_id","gene","mid","sample","treatment","critical_period")
+
+for(x in sleuth_significant_2$target_id[2:length(sleuth_significant_2$target_id)]){
+  tmp<-sleuth:::get_bootstrap_summary(so2, x, units= "scaled_reads_per_base")
+  t2<-cbind(rep(x,length(tmp$mid)),rep(sleuth_significant_2[sleuth_significant_2$target_id==x,"ext_gene"],length(tmp$mid)),
+          tmp$mid,tmp$sample,tmp$treatment,tmp$critical_period)
+  colnames(t2)<-c("target_id","gene","mid","sample","treatment","critical_period")
+  df<-rbind(df,t2)
+}
+  
+df$mid<-as.numeric(df$mid)
+df$gene<-as.factor(df$gene)  
+  
+  p <- ggplot(df, aes(x = gene, y=mid, color=critical_period))
+  p <- p + geom_boxplot() + ylab("scaled RNA expression") + theme(axis.text.x = element_text(angle = 50, hjust = 1))
+  p <- p + ggtitle(paste0("Sigificant Genes L.R.T q<",qval," for critical period status accross all days and conditions"))
+  
+  pdf("plots/bp_summaries_critical_period_full.pdf",height=5,width=10)
+  p
+  dev.off()
+  
+  
+  p <- p + theme(legend.position = "none", axis.text.x = element_blank()) + xlab(color_by)
+  p <- p + ggtitle(paste(sleuth_significant_2[sleuth_significant_2$target_id==target_id,"ext_gene"],":", target_id))
+  p <- p + ylab(units)
+  if (divide_groups) {
+    p <- p + facet_wrap(color_by, strip.position = "bottom", scales = "free_x")
+  }
+  p
+
+
+```
+
+```{r enrichment}
+sleuth_significant_2$target_id
+sleuth_significant_2$ext_gene
+
+
+all_gene_setsM = msigdbr(species = "Mus musculus")
+all_gene_setsH = msigdbr(species = "Homo sapiens")
+
+msigdbr_t2g = all_gene_setsM %>% dplyr::distinct(gs_name, gene_symbol) %>% as.data.frame()
+enricher(gene = sleuth_significant_2$ext_gene, TERM2GENE = msigdbr_t2g, ...)
+
+
+```
+
+
+```{r individual_bs_plots}
+gene<-sleuth_significant_2$target_id[1] #"ENSMUSG00000028978.12"
+cb<-"treatment"
+plot_bootstrap_mod(so, gene,sleuth_significant_2,units = "scaled_reads_per_base", color_by = cb)
+
+pdf(paste0("plots/bs_Day2ONLY_",sleuth_significant[sleuth_significant$target_id==gene,"ext_gene"],"_by",cb,".pdf"))
+plot_bootstrap_mod(so2, gene, units = "scaled_reads_per_base", color_by = cb)
+dev.off()
+
+pdf("plots/Tinagl1.pdf")
+plot_bootstrap(so, "ENSMUSG00000028776.14", units = "scaled_reads_per_base", color_by = "treatment")
+dev.off()
+
+```
+
+# Wald test
+
+The second type of statistical test we will do is the Wald test, allows us to compare each conditions to a baseline condition (control) to determine if there is a significant effect. Here, the estimated coefficients also encode direction of effect. 
+
+## treatment specific effects
+```{r ketamine_wald}
+sig_thresh<-0.2
+
+for(i in colnames(so$fits[["full"]]$design_matrix)[4:7]){
+  so<-sleuth_wt(so, i ,which_model="full")
+}
+
+```
+
+
+# Wald test
+
+The second type of statistical test we will do is the Wald test, allows us to compare each conditions to a baseline condition (control) to determine if there is a significant effect. Here, the estimated coefficients also encode direction of effect. 
+
+## treatment specific effects
+```{r ketamine_wald}
+sig_thresh<-0.2
+
+model<-"reduced_CP"
+indx<-grep("treatment",colnames(so$fits[[model]]$design_matrix))
+for(i in colnames(so$fits[[model]]$design_matrix)[indx]){
+  so<-sleuth_wt(so, i ,which_model=model)
+}
+
+```
+
+```{r CP_wald_table}
+sig_gene_ids<-list()
+numSG<-list()
+for(i in colnames(so$fits[[model]]$design_matrix)[indx]){
+  sleuth_table <- sleuth_results(so, i, test_type='wald', which_model=model, show_all = FALSE)
+  sleuth_table <- sleuth_table[!is.na(sleuth_table$pval),] #valid tests only
+  sleuth_table$b_zscore<-sleuth_table$b/sleuth_table$se_b
+  sleuth_significant <- sleuth_table[sleuth_table$qval <= sig_thresh,]
+  sig_gene_ids[[i]]<-sapply(sleuth_significant$target_id, function(x) sleuth_significant[sleuth_significant$target_id==x,"ext_gene"])
+  numSG[[i]]<-dim(sleuth_significant)[1]
+  print(dim(sleuth_significant[1]))
+  pdf(paste0(path,"/plots/Wald_saline_vs_",i,"_heatmap_",model,".pdf"),width=10,height=10)
+  plot_transcript_heatmap_mod(so2,sleuth_significant,'scaled_reads_per_base', # can replace with 'tpm' as needed
+                        annotation_cols = c('treatment','rna_isolation_batch',"critical_period"), scale = "row",
+                        color_high="yellow",color_mid="blue",color_low="black",main=paste("Sig Genes Wald Test saline vs", i)
+  )
+  dev.off()
+}
+
+```
+There are `r numSG` significant genes between `r names(numSG)` and saline at a q-value cutoff of `r sig_thresh`
+
+```{r VennDiagram}
+
+venn.diagram(
+  x = sig_gene_ids, category.names = gsub("treatment","",names(sig_gene_ids)),
+  filename = paste0(path,'/plots/Treatmentspecific_venn_diagramm_',model,'.png'),
+  output = TRUE)
+
+            imagetype="png" ,
+          #height = 480 , 
+          #width = 480 , 
+          #resolution = 300,
+          #compression = "lzw",
+          lwd = 1,
+          col=
+          fill = c(alpha("#440154ff",0.3), alpha('#21908dff',0.3), alpha('#fde725ff',0.3)),
+          #cex = 0.5,
+          fontfamily = "sans",
+          #cat.cex = 0.3,
+          cat.default.pos = "outer",
+          #cat.pos = c(-27, 27, 135),
+          #cat.dist = c(0.055, 0.055, 0.085),
+          cat.fontfamily = "sans",
+          cat.col = c("#440154ff", '#21908dff', '#fde725ff'),
+          rotation = 1
+)
+
+sg<-calculate.overlap(sig_gene_ids) 
+str(sg)
+
+sg$a13
+
+```
+
+# Session Information
+```{r session}
+sessionInfo()
+
+```
+
